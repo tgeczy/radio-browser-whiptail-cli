@@ -267,6 +267,35 @@ def get_station_votes(s: requests.Session, base: str, uuid: str) -> Optional[int
             return None
     return None
 
+def stations_topvote(
+    s: requests.Session,
+    base: str,
+    limit: int = 500,
+    hidebroken: bool = True,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Return top-voted stations (desc).
+    Uses the /rowcount variant and filters out entries without a usable UUID.
+    """
+    path = f"/json/stations/topvote/{int(limit)}" if limit else "/json/stations/topvote"
+    params: Dict[str, Any] = {}
+    if hidebroken:
+        params["hidebroken"] = "true"
+    if offset:
+        params["offset"] = str(int(offset))
+    try:
+        items = api_get(s, base, path, params=params)
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for st in items or []:
+        # Be tolerant across mirrors/versions.
+        u = (st.get("stationuuid") or st.get("uuid") or "").strip()
+        if u:
+            out.append(st)
+
+    return out
 # ---------- UI helpers ----------
 def have_whiptail() -> Optional[str]:
     for cmd in ("whiptail", "dialog"):
@@ -288,13 +317,21 @@ def _run_whiptail_capture(args: List[str]) -> Tuple[int, str]:
     if tty is None:
         return (1, "")
     with tty, tempfile.TemporaryFile(mode="w+b") as out:
-        args = list(args) + ["--output-fd", str(out.fileno())]
+        # Insert --output-fd before the '--' delimiter if present.
+        argv = list(args)
+        out_opt = ["--output-fd", str(out.fileno())]
+        if "--" in argv:
+            i = argv.index("--")
+            argv = argv[:i] + out_opt + argv[i:]
+        else:
+            argv += out_opt
+
         p = subprocess.run(
-            args,
+            argv,
             stdin=tty,
             stdout=tty,
             stderr=tty,
-            pass_fds=(out.fileno(),),  # <-- fixed: must be a tuple
+            pass_fds=(out.fileno(),),  # must be a tuple
             text=False
         )
         out.seek(0)
@@ -311,7 +348,8 @@ def msgbox(title: str, text: str) -> None:
 def menu_prompt(title: str, prompt: str, choices: Sequence[Tuple[str, str]]) -> Optional[str]:
     tool = have_whiptail()
     if in_tty() and tool and not TEXT_MENU:
-        cmd = [tool, "--title", title, "--menu", prompt, "20", "78", "15"]
+        # Height, width, list-height
+        cmd = [tool, "--title", title, "--menu", prompt, "20", "78", "15", "--"]
         for tag, item in choices:
             label = (item or "").replace("\n", " ").strip()
             if len(label) > 200:
@@ -319,6 +357,8 @@ def menu_prompt(title: str, prompt: str, choices: Sequence[Tuple[str, str]]) -> 
             cmd.extend([tag, label])
         rc, picked = _run_whiptail_capture(cmd)
         return picked if rc == 0 and picked else None
+
+    # Text-mode fallback
     print(f"\n== {title} ==")
     print(prompt)
     for i, (tag, item) in enumerate(choices, 1):
@@ -1405,6 +1445,7 @@ def main_menu(s: requests.Session, base: str) -> None:
         items: List[Tuple[str, str]] = [
             ("browse", "Browse by country / state"),
             ("search", "Search by name"),
+            ("top500", "Top-voted stations"),  # <--- NEW ITEM
             ("favs",   "Favorites"),
             ("audio",  f"Audio settings  [backend: {backend}  ALSA: {alsa_show}]"),
             ("log",    "Player log (last lines)"),
@@ -1435,6 +1476,8 @@ def main_menu(s: requests.Session, base: str) -> None:
             flow_by_country(s, base, cfg)
         elif choice == "search":
             flow_search(s, base, cfg)
+        elif choice == "top500":               # <--- NEW HANDLER
+            flow_topvoted(s, base, cfg)
         elif choice == "favs":
             flow_favorites(s, base, cfg)
         elif choice == "stop":
@@ -1599,6 +1642,41 @@ def flow_favorites(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
             return
         uuid = tag_to_uuid[tag]
         name = tag_to_label[tag]
+        station_actions(s, base, uuid, cfg, preknown_name=name)
+
+def flow_topvoted(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
+    stations = stations_topvote(s, base, limit=500, hidebroken=True)
+    if not stations:
+        msgbox("Top-voted", "No data returned.")
+        return
+
+    # Keep votes in the label; avoid shadowing 'base'
+    def _label(st: Dict[str, Any]) -> str:
+        votes = st.get("votes")
+        lbl = format_station_label(st)
+        return f"{lbl}   [votes: {votes}]" if votes is not None else lbl
+
+    choices, tag_to_uuid, tag_to_label = build_indexed_choices(
+        stations,
+        value_of=lambda st: (st.get("stationuuid") or st.get("uuid") or "").strip(),
+        label_of=_label
+    )
+
+    while True:
+        tag = menu_prompt("Top-voted (500)", "Pick a station.", choices + [("0", "Back")])
+        if tag in (None, "0"):
+            return
+
+        uuid = (tag_to_uuid.get(tag) or "").strip()
+        if not uuid:
+            # Defensive: mirror returned an entry without a UUID; skip gracefully.
+            msgbox("Top-voted", "This entry has no UUID (server returned malformed data). Try another.")
+            continue
+
+        # Use the label map we already built; strip trailing [votes: N] for a neat title
+        raw_name = (tag_to_label.get(tag) or "")
+        name = raw_name.split(" | ", 1)[0]
+        name = re.sub(r"\s+\[votes:\s*\d+\]\s*$", "", name)
         station_actions(s, base, uuid, cfg, preknown_name=name)
 
 def station_menu_loop(s: requests.Session, base: str, stations: List[Dict[str, Any]], cfg: Dict[str, Any]) -> None:
