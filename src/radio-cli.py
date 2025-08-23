@@ -147,6 +147,7 @@ def have_cmd(cmd: str) -> bool:
 def in_tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
+
 def host_id() -> str:
     for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
@@ -155,7 +156,15 @@ def host_id() -> str:
                 return t
         except Exception:
             pass
-    return os.uname().nodename
+    # Cross-platform fallback
+    try:
+        import platform
+        return platform.node() or socket.gethostname()
+    except Exception:
+        try:
+            return socket.gethostname()
+        except Exception:
+            return "unknown-host"
 
 def find_free_tcp_port(start: int, end: int) -> int:
     for port in range(start, end + 1):
@@ -564,12 +573,18 @@ def kill_session_if_alive() -> bool:
 # ---------- audio helpers ----------
 
 def _pulse_available() -> bool:
-    xdg = os.getenv("XDG_RUNTIME_DIR")
-    if xdg and (Path(xdg) / "pulse" / "native").exists():
-        return True
-    uid = os.getuid()
-    return Path(f"/run/user/{uid}/pulse/native").exists()
+    # Non-POSIX systems won't have Pulse sockets
+    if os.name != "posix":
+        return False
+    try:
+        xdg = os.getenv("XDG_RUNTIME_DIR")
+        if xdg and (Path(xdg) / "pulse" / "native").exists():
+            return True
+        uid = os.getuid()
+        return Path(f"/run/user/{uid}/pulse/native").exists()
+    except Exception:
 
+        return False
 def _pipewire_available() -> bool:
     """
     Heuristics: PipeWire runtime socket or pw-* tools.
@@ -611,6 +626,8 @@ def _current_player(cfg: Dict[str, Any]) -> Optional[str]:
 
 # ---------- VLC RC/HTTP helpers ----------
 def _rc_connect_unix(timeout: float = 0.5):
+    if not hasattr(socket, "AF_UNIX"):
+        return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -1530,7 +1547,7 @@ def audio_menu(cfg: Dict[str, Any]) -> Dict[str, Any]:
             ("back",    "Back"),
         ]
         # Only show ALSA override if backend is not 'pulse' or 'pipewire'
-        if backend not in ("pulse", "pipewire"):
+        if os.name == "posix" and backend not in ("pulse", "pipewire"):
             choices.insert(1, ("device",  f"ALSA device override (this machine): {alsa_show}"))
 
         c = menu_prompt("Audio settings", "Pick an option.", choices)
