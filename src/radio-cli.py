@@ -245,12 +245,15 @@ def search_stations(
     countrycode: Optional[str] = None,
     state: Optional[str] = None,
     limit: int = 200,
+    offset: int = 0,
     order: str = "name",
     hidebroken: bool = True,
 ) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": str(limit), "order": order}
     if hidebroken:
         params["hidebroken"] = "true"
+    if offset:
+        params["offset"] = str(int(offset))
     if name:
         params["name"] = name
     if countrycode:
@@ -280,31 +283,18 @@ def stations_topvote(
     s: requests.Session,
     base: str,
     limit: int = 500,
-    hidebroken: bool = True,
     offset: int = 0,
+    hidebroken: bool = True
 ) -> List[Dict[str, Any]]:
-    """
-    Return top-voted stations (desc).
-    Uses the /rowcount variant and filters out entries without a usable UUID.
-    """
-    path = f"/json/stations/topvote/{int(limit)}" if limit else "/json/stations/topvote"
-    params: Dict[str, Any] = {}
+    """Return top-voted stations (desc), paginated with limit/offset."""
+    params = {"limit": str(int(limit)), "offset": str(int(offset))}
     if hidebroken:
         params["hidebroken"] = "true"
-    if offset:
-        params["offset"] = str(int(offset))
     try:
-        items = api_get(s, base, path, params=params)
+        return api_get(s, base, "/json/stations/topvote", params=params)
     except Exception:
         return []
-    out: List[Dict[str, Any]] = []
-    for st in items or []:
-        # Be tolerant across mirrors/versions.
-        u = (st.get("stationuuid") or st.get("uuid") or "").strip()
-        if u:
-            out.append(st)
 
-    return out
 # ---------- UI helpers ----------
 def have_whiptail() -> Optional[str]:
     for cmd in ("whiptail", "dialog"):
@@ -353,8 +343,7 @@ def msgbox(title: str, text: str) -> None:
         print(f"\n[{title}] {text}\n")
         return
     _run_whiptail_capture([tool, "--title", title, "--msgbox", text, "12", "74"])
-
-def menu_prompt(title: str, prompt: str, choices: Sequence[Tuple[str, str]]) -> Optional[str]:
+def menu_prompt(title: str, prompt: str, choices: Sequence[Tuple[str, str]], *, start_index: int = 1) -> Optional[str]:
     tool = have_whiptail()
     if in_tty() and tool and not TEXT_MENU:
         # Height, width, list-height
@@ -400,15 +389,11 @@ def format_station_label(st: Dict[str, Any]) -> str:
     return f"{name}" if not meta else f"{name} | {meta}"
 
 def build_indexed_choices(
-    items: Sequence[Any],
-    value_of,
-    label_of,
-) -> Tuple[List[Tuple[str, str]], Dict[str, Any], Dict[str, str]]:
-    choices: List[Tuple[str, str]] = []
-    tag_to_value: Dict[str, Any] = {}
-    tag_to_label: Dict[str, str] = {}
-    for i, it in enumerate(items, 1):
-        tag = str(i)
+    items, value_of, label_of, *, start_index: int = 1
+):
+    choices, tag_to_value, tag_to_label = [], {}, {}
+    for i, it in enumerate(items, start_index):
+        tag = str(i)                           # <-- global, not per-page
         label = label_of(it)
         choices.append((tag, label))
         tag_to_value[tag] = value_of(it)
@@ -1596,7 +1581,7 @@ def audio_menu(cfg: Dict[str, Any]) -> Dict[str, Any]:
 # ---------- flows ----------
 
 def flow_by_country(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
-    countries = countries_codes(s, base)  # now returns [{name, code, stationcount}]
+    countries = countries_codes(s, base)
     choices, tag_to_country, _ = build_indexed_choices(
         countries,
         value_of=lambda c: {"name": c["name"], "code": c["code"]},
@@ -1610,7 +1595,6 @@ def flow_by_country(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None
     country_name = picked["name"]
     cc = picked["code"]
 
-    # Stay inside this country until the user backs to the countries menu
     while True:
         states = states_for_country(s, base, cc)
         if states:
@@ -1626,20 +1610,28 @@ def flow_by_country(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None
         else:
             state = None
 
-        stations = search_stations(s, base, countrycode=cc, state=state, limit=500)
-        if not stations:
-            msgbox("Stations", f"No stations found for {country_name} [{cc}].")
-            # Loop back to state picker (or reload the single-country view if no states)
-            continue
+        # The incorrect 'if not stations:' block has been removed from here.
 
-        station_menu_loop(s, base, stations, cfg)
+        def _fetch(offset: int) -> List[Dict[str, Any]]:
+            return search_stations(
+                s, base,
+                countrycode=cc,
+                state=state,
+                limit=500,
+                offset=offset,
+                order="name",
+                hidebroken=True
+            )
+
+        nice_title = f"Stations — {country_name}" + (f" / {state}" if state else "")
+        station_menu_loop_paged(s, base, nice_title, _fetch, cfg, page_size=500)
         # Back from stations -> show states again (same country)
 
 def flow_search(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
     name = input_prompt("Search", "Station name (substring):", "")
     if not name:
         return
-    stations = search_stations(s, base, name=name, limit=200)
+    stations = search_stations(s, base, name=name, limit=500)
     if not stations:
         msgbox("Stations", "No stations found.")
         return
@@ -1661,40 +1653,84 @@ def flow_favorites(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
         name = tag_to_label[tag]
         station_actions(s, base, uuid, cfg, preknown_name=name)
 
-def flow_topvoted(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
-    stations = stations_topvote(s, base, limit=500, hidebroken=True)
-    if not stations:
-        msgbox("Top-voted", "No data returned.")
-        return
-
-    # Keep votes in the label; avoid shadowing 'base'
-    def _label(st: Dict[str, Any]) -> str:
-        votes = st.get("votes")
-        lbl = format_station_label(st)
-        return f"{lbl}   [votes: {votes}]" if votes is not None else lbl
-
-    choices, tag_to_uuid, tag_to_label = build_indexed_choices(
-        stations,
-        value_of=lambda st: (st.get("stationuuid") or st.get("uuid") or "").strip(),
-        label_of=_label
-    )
-
+def station_menu_loop_paged(
+    s: requests.Session,
+    base: str,
+    title: str,
+    fetch_page,               # callable: offset:int -> List[station dicts]
+    cfg: Dict[str, Any],
+    page_size: int = 500,
+    label_of=None,            # optional: callable(station)->str
+) -> None:
+    """
+    Generic pager for large station lists. Shows 'Previous 500' / 'Load next 500'
+    when appropriate, and hands off to station_actions() for the picked station.
+    """
+    page = 0
     while True:
-        tag = menu_prompt("Top-voted (500)", "Pick a station.", choices + [("0", "Back")])
-        if tag in (None, "0"):
+        offset = page * page_size
+        stations = fetch_page(offset) or []
+        if not stations:
+            if page > 0:
+                msgbox(title, "No more stations.")
+                page = max(0, page - 1)
+                continue
+            msgbox(title, "No stations found.")
             return
 
-        uuid = (tag_to_uuid.get(tag) or "").strip()
-        if not uuid:
-            # Defensive: mirror returned an entry without a UUID; skip gracefully.
-            msgbox("Top-voted", "This entry has no UUID (server returned malformed data). Try another.")
+        make_label = label_of if callable(label_of) else format_station_label
+
+        choices, tag_to_station, _ = build_indexed_choices(
+            stations,
+            value_of=lambda st: st,
+            label_of=lambda st: make_label(st),
+            start_index=offset + 1                    
+        )
+
+        # Navigation footer
+        footer: List[Tuple[str, str]] = []
+        if page > 0:
+            footer.append(("prev", "◀ Previous 500"))
+        if len(stations) >= page_size:
+            footer.append(("next", "Load next 500 ▶"))
+        footer.append(("0", "Back"))
+
+        # --- THIS ENTIRE BLOCK HAS BEEN RE-INDENTED ---
+        tag = menu_prompt(f"{title} (page {page+1})", "Pick a station.", choices + footer, start_index=offset + 1)
+        if tag in (None, "0"):
+            return
+        if tag == "next":
+            page += 1
+            continue
+        if tag == "prev":
+            page = max(0, page - 1)
             continue
 
-        # Use the label map we already built; strip trailing [votes: N] for a neat title
-        raw_name = (tag_to_label.get(tag) or "")
-        name = raw_name.split(" | ", 1)[0]
-        name = re.sub(r"\s+\[votes:\s*\d+\]\s*$", "", name)
+        picked = tag_to_station.get(tag)
+        if not picked:
+            continue
+        uuid = picked.get("stationuuid", "")
+        name = (picked.get("name") or "").strip()
+        if not uuid:
+            msgbox(title, "Missing station UUID.")
+            continue
         station_actions(s, base, uuid, cfg, preknown_name=name)
+
+def flow_topvoted(s: requests.Session, base: str, cfg: Dict[str, Any]) -> None:
+    def _label(st: Dict[str, Any]) -> str:
+        base_lbl = format_station_label(st)
+        v = st.get("votes")
+        return f"{base_lbl}   [votes: {v}]" if v is not None else base_lbl
+
+    station_menu_loop_paged(
+        s,
+        base,
+        title="Top-voted",
+        fetch_page=lambda offset: stations_topvote(s, base, limit=500, offset=offset),
+        cfg=cfg,
+        page_size=500,
+        label_of=_label,
+    )
 
 def station_menu_loop(s: requests.Session, base: str, stations: List[Dict[str, Any]], cfg: Dict[str, Any]) -> None:
     choices, tag_to_uuid, tag_to_label = build_indexed_choices(
