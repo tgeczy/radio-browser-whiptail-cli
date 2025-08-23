@@ -48,7 +48,7 @@ BASE_CANDIDATES = [
 TEXT_MENU = os.getenv("RB_TEXT_MENU") == "1"  # set to 1 to force numbered prompts
 
 RB_PLAYER = os.getenv("RB_PLAYER", "").strip().lower() or None  # mpv|cvlc|vlc
-RB_AUDIO  = os.getenv("RB_AUDIO",  "auto").strip().lower()      # pulse|alsa|auto
+RB_AUDIO  = os.getenv("RB_AUDIO",  "auto").strip().lower()      # pulse|alsa|pipewire|auto
 RB_ALSA_DEVICE_ENV = os.getenv("RB_ALSA_DEVICE", "").strip()    # e.g., plughw:2,0
 
 DATA_DIR   = Path(os.environ.get("RB_DATA_DIR", str(Path.home() / ".local/share/radio-browser")))
@@ -521,6 +521,7 @@ def kill_session_if_alive() -> bool:
     RC_TCP_PORT, HTTP_PORT, HTTP_PASS = old_tcp, old_http, old_pass
     _session_clear()
     return stopped
+# ---------- audio helpers ----------
 
 def _pulse_available() -> bool:
     xdg = os.getenv("XDG_RUNTIME_DIR")
@@ -528,6 +529,29 @@ def _pulse_available() -> bool:
         return True
     uid = os.getuid()
     return Path(f"/run/user/{uid}/pulse/native").exists()
+
+def _pipewire_available() -> bool:
+    """
+    Heuristics: PipeWire runtime socket or pw-* tools.
+    Returns True if native PipeWire is likely available.
+    """
+    try:
+        xdg = os.getenv("XDG_RUNTIME_DIR") or ""
+        uid = os.getuid()
+        candidates = [
+            Path(xdg) / "pipewire-0",
+            Path(xdg) / "pulse" / "native",           # pipewire-pulse shim
+            Path(f"/run/user/{uid}/pipewire-0"),
+            Path(f"/run/user/{uid}/pulse/native"),
+        ]
+        if any(p.exists() for p in candidates):
+            return True
+    except Exception:
+        pass
+    for cmd in ("pw-cli", "pw-play", "pw-record", "pipewire"):
+        if have_cmd(cmd):
+            return True
+    return False
 
 def _per_host_alsa_override(cfg: Dict[str, Any]) -> Optional[str]:
     hid = host_id()
@@ -1214,6 +1238,7 @@ def detect_players(cfg: Dict[str, Any]) -> List[str]:
             ordered.append(p)
     return ordered
 
+
 def build_attempts(url: str, cfg: Dict[str, Any]) -> List[List[str]]:
     attempts: List[List[str]] = []
     backend = _current_audio_backend(cfg)
@@ -1223,22 +1248,41 @@ def build_attempts(url: str, cfg: Dict[str, Any]) -> List[List[str]]:
 
     def ao_args(p: str) -> List[List[str]]:
         arr: List[List[str]] = [[]]
+
+        # pipewire (native) tries first, then pulse, then alsa
+        if backend in ("pipewire", "auto") and _pipewire_available():
+            if p == "mpv":
+                # mpv native PipeWire
+                arr.append(["--ao=pipewire", "--no-video"])
+            elif p in ("vlc", "cvlc"):
+                # Only try if VLC was built with pipewire aout; opt-in via env
+                if os.getenv("RB_VLC_PIPEWIRE", "0") == "1":
+                    arr.append(["--aout=pipewire"])
+
         if backend in ("pulse", "auto") and pulse_ok:
-            arr.append(["--aout=pulse"] if p in ("vlc", "cvlc") else ["--audio-device=pulse", "--no-video"])
+            arr.append(["--aout=pulse"] if p in ("vlc", "cvlc")
+                       else ["--audio-device=pulse", "--no-video"])
+
         if backend in ("alsa", "auto"):
             if alsa_dev:
-                arr.append(["--aout=alsa","--alsa-audio-device", alsa_dev] if p in ("vlc","cvlc")
+                arr.append(["--aout=alsa", "--alsa-audio-device", alsa_dev] if p in ("vlc", "cvlc")
                            else ["--ao=alsa", f"--audio-device=alsa/{alsa_dev}", "--no-video"])
-            arr.append(["--aout=alsa"] if p in ("vlc","cvlc") else ["--ao=alsa","--no-video"])
-        arr.append(["--no-video"] if p=="mpv" else [])
+            arr.append(["--aout=alsa"] if p in ("vlc", "cvlc") else ["--ao=alsa", "--no-video"])
+
+        if p == "mpv":
+            arr.append(["--no-video"])
+
+        # dedupe
         uniq: List[List[str]] = []
         for a in arr:
             if a not in uniq:
                 uniq.append(a)
         return uniq
 
-    http1 = ["--extraintf", "http,mpris", "--http-host", "127.0.0.1", "--http-port", str(HTTP_PORT), "--http-password", HTTP_PASS]
-    http2 = ["--extraintf", "http,mpris", "--http-host", "127.0.0.1", "--http-port", str(HTTP_PORT),
+    http1 = ["--extraintf", "http,mpris", "--http-host", "127.0.0.1",
+             "--http-port", str(HTTP_PORT), "--http-password", HTTP_PASS]
+    http2 = ["--extraintf", "http,mpris", "--http-host", "127.0.0.1",
+             "--http-port", str(HTTP_PORT),
              "--lua-config", f"http={{password='{HTTP_PASS}'}}"]
 
     for p in players:
@@ -1437,19 +1481,24 @@ def audio_menu(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cur_player = _current_player(cfg) or "auto"
 
         choices: List[Tuple[str, str]] = [
-            ("backend", f"Audio backend: {backend}      (auto / pulse / alsa)"),
+            ("backend", f"Audio backend: {backend}      (auto / pipewire / pulse / alsa)"),
             ("player",  f"Preferred player: {cur_player}  (auto/mpv/cvlc/vlc)"),
             ("test",    "Test tone (1s, 440Hz)  — uses ALSA override or default"),
             ("back",    "Back"),
         ]
-        # Only show ALSA override if backend is not 'pulse'
-        if backend != "pulse":
+        # Only show ALSA override if backend is not 'pulse' or 'pipewire'
+        if backend not in ("pulse", "pipewire"):
             choices.insert(1, ("device",  f"ALSA device override (this machine): {alsa_show}"))
+
         c = menu_prompt("Audio settings", "Pick an option.", choices)
         if c in (None, "back"):
             return cfg
         if c == "backend":
-            b = menu_prompt("Audio backend", "Choose:", [("auto","auto"), ("pulse","pulse"), ("alsa","alsa")])
+            opts = [("auto","auto")]
+            if _pipewire_available():  # offer only if present
+                opts.append(("pipewire","pipewire"))
+            opts.extend([("pulse","pulse"), ("alsa","alsa")])
+            b = menu_prompt("Audio backend", "Choose:", opts)
             if b:
                 cfg["audio_backend"] = b
                 save_config(cfg)
